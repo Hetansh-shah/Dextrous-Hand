@@ -1,0 +1,103 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import struct
+import crcmod
+import serial
+
+# Initialize MediaPipe Hand Tracking
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+# Initialize Serial Communication (RS-485)
+ser = serial.Serial(
+    port="COM7",  
+    baudrate=115200,
+    bytesize=serial.EIGHTBITS,
+    parity=serial.PARITY_NONE,
+    stopbits=serial.STOPBITS_ONE,
+    timeout=2
+)
+
+def modbus_crc(data):
+    """Calculate Modbus RTU CRC16"""
+    crc16 = crcmod.predefined.mkPredefinedCrcFun("modbus")
+    return struct.pack('<H', crc16(data))
+
+def send_finger_angles(angles):
+    """ Sends mapped angles to the robotic hand """
+    angle_bytes = struct.pack(">HHHHHH", *angles)  # Convert angles to bytes
+    command = bytearray([0x01, 0x10, 0x05, 0xCE, 0x00, 0x06, 0x0C]) + angle_bytes
+    command += modbus_crc(command)  # Add CRC
+    ser.write(command)
+    response = ser.read_all()
+    return response.hex()
+
+# Track min/max values dynamically
+global_min = float("inf")
+global_max = float("-inf")
+
+def calculate_finger_angles(landmarks):
+    """ Dynamically maps fingertip positions: Open = 1000, Closed = 0 """
+    global global_min, global_max
+    fingertips = [20, 16, 12, 8, 4]  # [Little, Ring, Middle, Index, Thumb]
+    palm = landmarks[0]  # Palm base as reference
+
+    distances = []
+    for fingertip in fingertips:
+        tip = np.array([landmarks[fingertip].x, landmarks[fingertip].y])
+        base = np.array([palm.x, palm.y])
+        dist = np.linalg.norm(tip - base)  # Distance from palm to fingertip
+        distances.append(dist)
+
+    # Update global min/max distances
+    global_min = min(global_min, min(distances))
+    global_max = max(global_max, max(distances))
+
+    # Ensure we have enough data before normalizing
+    if global_min == global_max:
+        return [0] * 5 + [500]  # Default to closed fist if no variation
+
+    angles = [
+        int((dist - global_min) / (global_max - global_min) * 1000)
+        for dist in distances
+    ]
+    angles = [max(0, min(1000, a)) for a in angles]  # Clamp values between 0-1000
+    angles.append(500)  # Thumb rotation (adjust if needed)
+
+    return angles
+
+# Open Webcam
+cap = cv2.VideoCapture(0)
+
+print("Tracking fingertips & palm... Press 'Q' to quit.")
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    frame = cv2.flip(frame, 1)  # Flip horizontally
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result = hands.process(rgb_frame)
+
+    if result.multi_hand_landmarks:
+        for hand_landmarks in result.multi_hand_landmarks:
+            # Draw only fingertips & palm base
+            for i in [0, 4, 8, 12, 16, 20]:  # Wrist + 5 fingertips
+                x, y = int(hand_landmarks.landmark[i].x * frame.shape[1]), int(hand_landmarks.landmark[i].y * frame.shape[0])
+                cv2.circle(frame, (x, y), 7, (0, 255, 0), -1)  # Green dots for fingertips
+
+            # Map angles & send to robotic hand
+            finger_angles = calculate_finger_angles(hand_landmarks.landmark)
+            send_finger_angles(finger_angles)
+            print("Sent Angles:", finger_angles)
+
+    cv2.imshow("Fingertip Tracking", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+ser.close()
